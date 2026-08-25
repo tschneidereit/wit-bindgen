@@ -1,11 +1,13 @@
 use crate::config::StringList;
 use crate::{Compile, LanguageMethods, Runner, Verify};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use heck::ToSnakeCase;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
+use std::fmt::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,7 +37,7 @@ pub struct State {
 
 /// Rust-specific configuration of component files
 #[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct RustConfig {
     /// Space-separated list or array of compiler flags to pass.
     #[serde(default)]
@@ -44,6 +46,13 @@ struct RustConfig {
     /// main crate.
     #[serde(default)]
     externs: Vec<String>,
+    /// Additionally build this file as a position-independent shared library
+    /// and check the stream/future intrinsics that library imports, as
+    /// described on `check_pic_shared_link`. The file must use at least one
+    /// stream or future. That extra build forces a single codegen unit,
+    /// overriding any `-Ccodegen-units` in `rustflags`.
+    #[serde(default)]
+    pic_shared_link: bool,
 }
 
 #[derive(Deserialize)]
@@ -239,16 +248,15 @@ path = 'lib.rs'
             externs.push((stem.to_string(), output));
         }
 
+        let bindings = compile.bindings_dir.join(format!(
+            "{}.rs",
+            compile.component.bindgen.world.replace('-', "_")
+        ));
+
         // Compile the main crate, passing `--extern` for all upstream crates.
         let mut cmd = rustc(&compile.component.path, &output);
-        cmd.env(
-            "BINDINGS",
-            compile.bindings_dir.join(format!(
-                "{}.rs",
-                compile.component.bindgen.world.replace('-', "_")
-            )),
-        );
-        for (name, path) in externs {
+        cmd.env("BINDINGS", &bindings);
+        for (name, path) in externs.iter() {
             let arg = format!("--extern={name}={}", path.display());
             cmd.arg(arg);
         }
@@ -261,6 +269,28 @@ path = 'lib.rs'
         runner
             .convert_p1_to_component(&output, compile)
             .with_context(|| format!("failed to convert {output:?}"))?;
+
+        if config.pic_shared_link {
+            // A single codegen unit keeps `--emit=obj` to the one object file
+            // named by `-o`.
+            let object = compile.artifacts_dir.join("pic.o");
+            let mut cmd = rustc(&compile.component.path, &object);
+            cmd.env("BINDINGS", &bindings);
+            for (name, path) in externs.iter() {
+                let arg = format!("--extern={name}={}", path.display());
+                cmd.arg(arg);
+            }
+            cmd.arg("--crate-type=cdylib")
+                .arg("--emit=obj")
+                .arg("-Ccodegen-units=1")
+                .arg("-Crelocation-model=pic");
+            runner.run_command(&mut cmd)?;
+
+            let library = compile.artifacts_dir.join("pic.so");
+            runner.link_shared(&object, &library)?;
+            check_pic_shared_link(&library)
+                .with_context(|| format!("unusable stream/future vtables in {library:?}"))?;
+        }
 
         Ok(())
     }
@@ -354,4 +384,132 @@ impl Runner {
             _ => true,
         }
     }
+
+    /// Links `object` into a position-independent shared library at `output`
+    /// using the `rust-lld` of the current toolchain.
+    ///
+    /// Only `object` is linked, so the symbols it uses from the standard
+    /// library are left undefined and `--allow-undefined` turns them into
+    /// imports. That keeps this link independent of whether a
+    /// position-independent build of the standard library is available.
+    fn link_shared(&self, object: &Path, output: &Path) -> Result<()> {
+        let libdir = self.run_command(Command::new("rustc").arg("--print").arg("target-libdir"))?;
+        let lld = Path::new(libdir.trim())
+            .parent()
+            .with_context(|| format!("failed to find the toolchain directory of {libdir:?}"))?
+            .join("bin")
+            .join(format!("rust-lld{}", env::consts::EXE_SUFFIX));
+        self.run_command(
+            Command::new(&lld)
+                .arg("-flavor")
+                .arg("wasm")
+                .arg("-shared")
+                .arg("--experimental-pic")
+                .arg("--allow-undefined")
+                .arg("--no-entry")
+                .arg("-o")
+                .arg(output)
+                .arg(object),
+        )?;
+        Ok(())
+    }
+}
+
+/// The seven intrinsics stored in a stream or future vtable, as they are
+/// spelled in import names.
+const VTABLE_INTRINSICS: &[&str] = &[
+    "new",
+    "cancel-write",
+    "cancel-read",
+    "drop-writable",
+    "drop-readable",
+    "read",
+    "write",
+];
+
+/// Checks that the shared library `library` imports all seven intrinsics of
+/// every stream/future vtable it contains, and that it contains at least one
+/// such vtable.
+///
+/// An import that is only address-taken is lowered by LLVM to a `GOT.func`
+/// global keyed by its mangled Rust symbol, and the canonical `(module, field)`
+/// import is dropped. This happens in position-independent code, which is how
+/// a shared library is built. No library exports the mangled symbol, so a
+/// component linker leaves the `GOT.func` slot unresolved and calls through the
+/// vtable trap. Generated bindings therefore store the address of a local
+/// wrapper in the vtable and have the wrapper call the intrinsic by name, which
+/// keeps the canonical import in the module.
+fn check_pic_shared_link(library: &Path) -> Result<()> {
+    let bytes = fs::read(library).with_context(|| format!("failed to read {library:?}"))?;
+
+    // Keyed by the import module, the payload kind, the vtable index, and the
+    // name of the function the vtable belongs to.
+    let mut vtables = BTreeMap::<_, BTreeSet<_>>::new();
+    let mut got_func = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        let wasmparser::Payload::ImportSection(section) = payload? else {
+            continue;
+        };
+        for import in section.into_imports() {
+            let import = import?;
+            if import.module == "GOT.func" {
+                got_func.push(import.name.to_string());
+            } else if let Some(((kind, index, func), intrinsic)) =
+                parse_vtable_intrinsic(import.name)
+            {
+                vtables
+                    .entry((import.module.to_string(), kind, index, func))
+                    .or_default()
+                    .insert(intrinsic);
+            }
+        }
+    }
+
+    if vtables.is_empty() {
+        let mut error = String::from(
+            "no stream or future intrinsic is imported by name, so no vtable in \
+             this library can be linked into a component",
+        );
+        if !got_func.is_empty() {
+            error.push_str("\nthe library imports these `GOT.func` globals instead:");
+            for name in got_func.iter() {
+                write!(error, "\n  {name}")?;
+            }
+        }
+        bail!("{error}");
+    }
+
+    for ((module, kind, index, func), intrinsics) in vtables {
+        let missing = VTABLE_INTRINSICS
+            .iter()
+            .filter(|name| !intrinsics.contains(**name))
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "the {kind} vtable `{index}` of `{module}#{func}` is missing imports \
+                 of these intrinsics: {}",
+                missing.join(", "),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Splits an import name such as `[async-lower][stream-read-0]read-stream` into
+/// the vtable it belongs to, `("stream", 0, "read-stream")`, and the intrinsic
+/// within that vtable, `"read"`. Returns `None` for all other import names.
+fn parse_vtable_intrinsic(name: &str) -> Option<((&str, u32, &str), &str)> {
+    let name = name.strip_prefix("[async-lower]").unwrap_or(name);
+    let (bracketed, func) = name.strip_prefix('[')?.split_once(']')?;
+    let (kind, rest) = bracketed.split_once('-')?;
+    if kind != "stream" && kind != "future" {
+        return None;
+    }
+    let (intrinsic, index) = rest.rsplit_once('-')?;
+    if !VTABLE_INTRINSICS.contains(&intrinsic) {
+        return None;
+    }
+    Some(((kind, index.parse().ok()?, func), intrinsic))
 }

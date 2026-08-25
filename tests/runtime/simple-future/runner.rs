@@ -1,4 +1,6 @@
 //@ wasmtime-flags = '-Wcomponent-model-async'
+//@ [lang]
+//@ pic-shared-link = true
 
 include!(env!("BINDINGS"));
 

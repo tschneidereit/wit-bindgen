@@ -307,10 +307,14 @@ default `args` option for bindings generator options
 //@ [lang]
 //@ rustflags = '-O'
 //@ externs = ['./other.rs']
+//@ pic-shared-link = true
 ```
 
-Here the crate will be compiled with `-O` and `./other.rs` will be compiled as a
-separate crate and passed as `--extern`
+Here the crate will be compiled with `-O`, `./other.rs` will be compiled as a
+separate crate and passed as `--extern`, and the crate will additionally be
+built as a position-independent shared library whose stream/future vtables are
+checked for being linkable into a component. Files using `pic-shared-link` must
+use at least one stream or future.
 
 #### Configuration: C
 
